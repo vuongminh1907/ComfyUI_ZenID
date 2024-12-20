@@ -1,6 +1,6 @@
 [project]
 name = "comfyui_zenid"
-description = ""
+description = "Inspired by [a/InstantID](https://github.com/instantX-research/InstantID) and [a/InstantID Comfy](https://github.com/cubiq/ComfyUI_InstantID)\nThis ZenID Node has been refactored for specialized tasks like Face Swap"
 version = "1.0.0"
 license = {file = "LICENSE"}
 
