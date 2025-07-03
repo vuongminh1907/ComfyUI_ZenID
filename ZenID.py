@@ -27,6 +27,13 @@ else:
     current_paths, _ = folder_paths.folder_names_and_paths["instantid"]
 folder_paths.folder_names_and_paths["instantid"] = (current_paths, folder_paths.supported_pt_extensions)
 
+FACE_FUSION_DIR = os.path.join(folder_paths.models_dir, "face_fusion")
+if "face_fusion" not in folder_paths.folder_names_and_paths:
+    current_paths = [FACE_FUSION_DIR]
+else:
+    current_paths, _ = folder_paths.folder_names_and_paths["face_fusion"]
+folder_paths.folder_names_and_paths["face_fusion"] = (current_paths, folder_paths.supported_pt_extensions)
+
 INSIGHTFACE_DIR = os.path.join(folder_paths.models_dir, "insightface")
 
 arcface_dst = np.array(
@@ -141,6 +148,95 @@ class ImageProjModel(torch.nn.Module):
         clip_extra_context_tokens = self.proj(embeds).reshape(-1, self.clip_extra_context_tokens, self.cross_attention_dim)
         clip_extra_context_tokens = self.norm(clip_extra_context_tokens)
         return clip_extra_context_tokens
+    
+class ResidualBlock(torch.nn.Module):
+    def __init__(self, dim, use_layernorm=True, use_relu=True):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(dim, dim)
+        self.linear2 = torch.nn.Linear(dim, dim)
+        self.use_layernorm = use_layernorm
+        self.use_relu = use_relu
+
+        if use_layernorm:
+            self.norm1 = torch.nn.LayerNorm(dim)
+            self.norm2 = torch.nn.LayerNorm(dim)
+        if use_relu:
+            self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        identity = x
+        out = self.linear1(x)
+        if self.use_layernorm:
+            out = self.norm1(out)
+        if self.use_relu:
+            out = self.relu(out)
+        out = self.linear2(out)
+        if self.use_layernorm:
+            out = self.norm2(out)
+        out += identity
+        return out
+
+class EncoderNet(torch.nn.Module):
+    def __init__(self, dim=512, hidden_dim=1024, depth=4, use_batchnorm=False):
+        super().__init__()
+        layers = []
+        self.linear_layers = []
+        self.norm_layers = []
+        self.use_batchnorm = use_batchnorm
+        
+        for i in range(depth):
+            in_dim = dim if i == 0 else hidden_dim
+            out_dim = dim if i == depth - 1 else hidden_dim
+            linear = torch.nn.Linear(in_dim, out_dim)
+            layers.append(linear)
+            self.linear_layers.append(linear)
+
+            if i != depth - 1 and self.use_batchnorm:
+                norm = torch.nn.BatchNorm1d(out_dim)
+                layers.append(norm)
+                self.norm_layers.append(norm)
+
+        self.net = torch.nn.Sequential(*layers)
+
+
+    def forward(self, x):
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        return self.net(x)
+
+
+class FaceFusionNet(torch.nn.Module):
+    def __init__(self, residual_depth=6, encoder_depth=4,
+                 dim=512, hidden_dim=1024,
+                 use_layernorm=True, use_relu=False, use_batchnorm=False):
+        super().__init__()
+
+        self.encoder = EncoderNet(dim=dim, hidden_dim=hidden_dim,
+                                  depth=encoder_depth, use_batchnorm=use_batchnorm)
+        
+        self.input_linear = torch.nn.Linear(hidden_dim, dim, bias=False)
+
+
+        self.residual_blocks = torch.nn.Sequential(*[
+            ResidualBlock(dim, use_layernorm=use_layernorm, use_relu=use_relu)
+            for _ in range(residual_depth)
+        ])
+
+        self.output_linear = torch.nn.Linear(dim, dim)
+
+    def forward(self, a, b):
+        out_a = self.encoder(a)  
+        out_b = self.encoder(b) 
+
+        x = torch.cat([out_a, out_b], dim=-1)  
+
+        x = self.input_linear(x)
+
+        x = self.residual_blocks(x) 
+
+        x = self.output_linear(x) 
+
+        return x
 
 class To_KV(torch.nn.Module):
     def __init__(self, state_dict):
@@ -527,6 +623,7 @@ class ZenIDCombineFace:
                 "image_1": ("IMAGE", ),
                 "image_2": ("IMAGE", ),
                 "instantid_file": (folder_paths.get_filename_list("instantid"), ),
+                "fusion_file": (folder_paths.get_filename_list("face_fusion"), ),
                 "insightface": (["CPU", "CUDA", "ROCM", "CoreML"], ),
                 "balance": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01, }),
                 "weight": ("FLOAT", {"default": .8, "min": 0.0, "max": 5.0, "step": 0.01, }),
@@ -543,6 +640,14 @@ class ZenIDCombineFace:
     def load_insight_face(self, provider):
         model = FaceAnalysis(name="antelopev2", root=INSIGHTFACE_DIR, providers=[provider + 'ExecutionProvider',]) # alternative to buffalo_l
         model.prepare(ctx_id=0, det_size=(640, 640))
+
+        return model
+
+    def load_fusion_model(self, fusion_file):
+        ckpt_path = folder_paths.get_full_path("face_fusion", fusion_file)
+        model = FaceFusionNet()
+        model.load_state_dict(torch.load(ckpt_path))
+        model.eval()
 
         return model
     
@@ -570,10 +675,11 @@ class ZenIDCombineFace:
 
         return model
 
-    def combine_face(self, instantid_file, insightface, control_net, image_1, balance, image_2, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average'):
+    def combine_face(self, instantid_file, insightface, fusion_file, control_net, image_1, balance, image_2, model, positive, negative, start_at, end_at, weight=.8, ip_weight=None, cn_strength=None, noise=0.35, image_kps=None, mask=None, combine_embeds='average'):
         #load instantid model
         instantid = self.load_model(instantid_file)
         insightface = self.load_insight_face(insightface)
+        fusion_model = self.load_fusion_model(fusion_file)
 
         dtype = comfy.model_management.unet_dtype()
         if dtype not in [torch.float32, torch.float16, torch.bfloat16]:
@@ -587,16 +693,20 @@ class ZenIDCombineFace:
 
         face_embed_1 = extractFeatures(insightface, image_1)
         face_embed_2 = extractFeatures(insightface, image_2)
+
+
+        label_embed = face_embed_1 * balance + face_embed_2 * (1 - balance)
+
         if face_embed_1 is None:
             raise Exception('Reference Image: No face detected.')
         
         if face_embed_2 is None:
             raise Exception('Reference Image: No face detected.')
 
-        if balance < 0.5:
-            face_embed = face_embed_1 * (1 - balance) + face_embed_2 * balance
-        else:
-            face_embed = face_embed_2 * (1 - balance) + face_embed_1 * balance
+        face_embed_1 = face_embed_1 * balance * 2
+        face_embed_2 = face_embed_2 * (1 - balance) * 2
+
+        face_embed = fusion_model(face_embed_1, face_embed_2)
 
         ratio = 8.0
         dst = arcface_dst * ratio
